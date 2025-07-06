@@ -5,13 +5,20 @@
 
 !playwright install chromium
 
+import pathlib
+from IPython.display import FileLink, HTML
+import shutil
+
+DOWNLOAD_DIR = pathlib.Path("/content/downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
 import os, sys, textwrap, re, json, time, asyncio, tempfile, pathlib, hashlib, warnings
 from typing import TypedDict, List, Dict, Any
 
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = "..."
 
 TOPK, MAX_WORKERS, MAX_ITER, WORKER_STEPS = 3, 5, 4, 3
-LINK_LIMIT = 100 # how many <a href> tags the sub-LLM will inspect
+LINK_LIMIT = 100      # how many <a href> tags the sub-LLM will inspect
 DEBUG = True
 
 import ray, nest_asyncio
@@ -93,9 +100,13 @@ async def worker_job(url: str) -> dict:
                     return {"status": "failed", "reason": f"http {resp.status}"}
 
                 data  = await resp.body()
-                tmp   = pathlib.Path(tempfile.mkdtemp()) / pathlib.Path(final_url).name or "download.bin"
-                tmp.write_bytes(data)
-                size, path = tmp.stat().st_size, str(tmp)
+                ext  = pathlib.Path(final_url).suffix or ".bin"
+                name = hashlib.sha256(final_url.encode()).hexdigest()[:40] + ext
+                dest = DOWNLOAD_DIR / name
+                dest.write_bytes(data)
+
+                size, path = dest.stat().st_size, str(dest)
+
 
             sha = hashlib.sha256(final_url.encode()).hexdigest()
             await browser.close()
@@ -181,9 +192,9 @@ def planner(s: S):
     resp = PLAN_LLM.invoke(prompt).content.strip()
 
     if DEBUG:
-        print("\n-----------PLANNER PROMPT ----------")
+        print("\n════════════ PLANNER PROMPT ════════════")
         print(prompt)
-        print("-------- PLANNER RESPONSE ------")
+        print("════════════ PLANNER RESPONSE ══════════")
         print(resp, "\n")
 
     thought = re.search(r"Thought:\s*(.*)", resp, re.S)
@@ -227,7 +238,7 @@ def search(s: S):
 def fetch(s: S):
     s["results"] = {u: fetch_media.run(u) for u in s["candidates"]}
     if DEBUG:
-        print("\n FETCH RESULTS")
+        print("\n⬇️  FETCH RESULTS")
         for u, r in s["results"].items():
             print(u[:80], "→", r["status"], f"({r.get('size','?')} B)")
     return s
@@ -237,9 +248,9 @@ def verify(s: S):
     for u, r in s["results"].items():
         if r["status"] == "ok":
             ok.append((u, r))
-            lines.append(f"{u.split('/')[2]}")
+            lines.append(f"✔ {u.split('/')[2]}")
         else:
-            lines.append(f"{u.split('/')[2]} ({r.get('reason','?')})")
+            lines.append(f"✘ {u.split('/')[2]} ({r.get('reason','?')})")
 
     s["verified"], s["last_obs"] = ok, "; ".join(lines)
     return s
@@ -274,6 +285,13 @@ g.add_conditional_edges("gate", lambda s: s["next"], {"planner": "planner", "exi
 g.set_entry_point("planner")
 orch = g.compile()
 
+# Demo
+
+def rel_to_notebook(path: str | pathlib.Path) -> str:
+    path = pathlib.Path(path).resolve()
+    root = pathlib.Path("/content").resolve() 
+    return str(path.relative_to(root))
+
 init = S(
     query="Big Buck Bunny 2008 1080p mp4 download",
     iter=0,
@@ -281,5 +299,28 @@ init = S(
 )
 out  = await orch.ainvoke(init, config={"recursion_limit": 40})
 
-print("\nBEST RESULT" , out.get("best", {}))
-print("TOTAL LOOPS:", out["iter"])
+print("\n BEST RESULT" , out.get("best", {}))
+print(" TOTAL LOOPS:", out["iter"])
+
+best = out.get("best", {})
+if best.get("path"):
+    rel = rel_to_notebook(best["path"])
+
+    print(f"File saved to: {best['path']}  ({best.get('size', '?')} bytes)")
+
+    display(FileLink(rel, result_html_prefix="⬇️  Download: "))
+
+    if re.search(r"\.(mp4|mkv|webm|mov|ogg)$", rel, re.I):
+        web_src = f"/files/{rel}"
+        display(HTML(f"""
+          <video src="{web_src}" controls style="max-width:100%; margin-top:12px;">
+            Sorry, your browser can't play this video.
+          </video>
+        """))
+
+else:
+    print(" No local file was saved (magnet link or fetch failed).")
+
+
+print("rel:", rel) 
+!ls -lh "/content/{rel}"
