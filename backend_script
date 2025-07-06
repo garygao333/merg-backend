@@ -3,7 +3,16 @@
   langchain-openai langgraph langchain-core duckduckgo-search \
   tiktoken
 
+!pip install -q google-cloud-storage
 !playwright install chromium
+
+import datetime as dt
+
+import os
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/content/gcs_key.json"
+
+from google.cloud import storage
+GCS_BUCKET = "merg-testing"
 
 import pathlib
 from IPython.display import FileLink, HTML
@@ -100,23 +109,37 @@ async def worker_job(url: str) -> dict:
                     return {"status": "failed", "reason": f"http {resp.status}"}
 
                 data  = await resp.body()
+
+                # local writings
                 ext  = pathlib.Path(final_url).suffix or ".bin"
                 name = hashlib.sha256(final_url.encode()).hexdigest()[:40] + ext
                 dest = DOWNLOAD_DIR / name
                 dest.write_bytes(data)
-
                 size, path = dest.stat().st_size, str(dest)
 
+                # uploading to gcs
+                gcs_client = storage.Client() 
+                bucket     = gcs_client.bucket(GCS_BUCKET)
+                blob       = bucket.blob(name)
 
-            sha = hashlib.sha256(final_url.encode()).hexdigest()
-            await browser.close()
-            return dict(status="ok",
-                        url=final_url,
-                        path=path,
-                        size=size,
-                        hash=sha,
-                        elapsed=round(time.time()-t0, 2))
+                blob.upload_from_filename(dest)
+                signed_url = blob.generate_signed_url(
+                    expiration=dt.timedelta(days=1),
+                    method="GET", 
+                )
 
+
+                sha = hashlib.sha256(final_url.encode()).hexdigest()
+                await browser.close()
+                return dict(
+                    status  = "ok",
+                    url     = final_url,
+                    path    = path,
+                    gcs_url = signed_url,
+                    size    = size,
+                    hash    = sha,
+                    elapsed = round(time.time() - t0, 2)
+                )
         except Exception as e:
             await browser.close()
             return {"status": "failed", "reason": repr(e)}
@@ -303,24 +326,27 @@ print("\n BEST RESULT" , out.get("best", {}))
 print(" TOTAL LOOPS:", out["iter"])
 
 best = out.get("best", {})
-if best.get("path"):
-    rel = rel_to_notebook(best["path"])
 
-    print(f"File saved to: {best['path']}  ({best.get('size', '?')} bytes)")
+if best.get("gcs_url"):
+    print(f" GCS URL: {best['gcs_url']}")
+    print(f" Size   : {best.get('size','?')/1e6:.2f} MB")
 
-    display(FileLink(rel, result_html_prefix="⬇️  Download: "))
+    # download link
+    display(HTML(f'<a href="{best["gcs_url"]}" download>⬇️ Download from GCS</a>'))
 
-    if re.search(r"\.(mp4|mkv|webm|mov|ogg)$", rel, re.I):
-        web_src = f"/files/{rel}"
+    # inline player
+    if re.search(r"\.(mp4|mkv|webm|mov|ogg)$", best["gcs_url"], re.I):
         display(HTML(f"""
-          <video src="{web_src}" controls style="max-width:100%; margin-top:12px;">
+          <video src="{best['gcs_url']}" controls style="max-width:100%; margin-top:12px;">
             Sorry, your browser can't play this video.
           </video>
         """))
 
+elif best.get("path"):
+    rel = rel_to_notebook(best["path"])
+    display(FileLink(rel, result_html_prefix="Local download: "))
 else:
-    print(" No local file was saved (magnet link or fetch failed).")
-
+    print("Nothing was saved.")
 
 print("rel:", rel) 
 !ls -lh "/content/{rel}"
