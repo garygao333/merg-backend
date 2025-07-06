@@ -1,0 +1,285 @@
+!pip -q install \
+  ray playwright==1.44.0 \
+  langchain-openai langgraph langchain-core duckduckgo-search \
+  tiktoken
+
+!playwright install chromium
+
+import os, sys, textwrap, re, json, time, asyncio, tempfile, pathlib, hashlib, warnings
+from typing import TypedDict, List, Dict, Any
+
+os.environ["OPENAI_API_KEY"] = "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"
+
+TOPK, MAX_WORKERS, MAX_ITER, WORKER_STEPS = 3, 5, 4, 3
+LINK_LIMIT = 100 # how many <a href> tags the sub-LLM will inspect
+DEBUG = True
+
+import ray, nest_asyncio
+nest_asyncio.apply()
+ray.shutdown(); ray.init(ignore_reinit_error=True, num_cpus=MAX_WORKERS, log_to_driver=False)
+
+from playwright.async_api import async_playwright
+from duckduckgo_search import DDGS
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph
+
+TINY_LLM = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.2)
+PLAN_LLM = ChatOpenAI(model="gpt-4o-mini",        temperature=0.0)
+
+def extract_json_list(text: str) -> List[str]:
+    m = re.search(r"\[[^\]]+\]", text, re.S)
+    if not m: return []
+    try: return json.loads(m.group(0))
+    except Exception: return []
+
+async def click_reason(page):
+    links = await page.eval_on_selector_all(
+        "a[href]",
+        f"els => els.slice(0, {LINK_LIMIT}).map(e => {{return {{text:e.innerText.trim(), href:e.href}}}})"
+    )
+    title  = await page.title()
+    prompt = textwrap.dedent(f"""
+        You are a focused helper. Your job is to choose the ONE link that is
+        most likely a direct media download (mp4, mkv, avi, torrent) or a magnet link.
+
+        Page title: {title}
+        Links (first 20):
+        {json.dumps(links, indent=2)}
+
+        Answer with EITHER the single link OR the word STOP.
+    """).strip()
+
+    tiny = ChatOpenAI(model="gpt-3.5-turbo-0125", temperature=0.2)
+    resp = (await tiny.ainvoke(prompt)).content.strip()
+
+    if DEBUG:
+        print("\n─── sub-LLM PROMPT ─────────────────────────────────────")
+        print(prompt)
+        print("─── sub-LLM RESP ───────────────────────────────────────")
+        print(resp, "\n")
+
+    return resp.split()[0]
+
+async def worker_job(url: str) -> dict:
+    t0 = time.time()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        page    = await browser.new_page()
+
+        try:
+            await page.goto(url, timeout=45_000)
+            if DEBUG: print(f"Visiting {page.url[:90]}")
+
+            for _ in range(WORKER_STEPS):
+                if page.url.startswith("magnet:") or re.search(r"\.(mp4|mkv|avi|torrent)$", page.url):
+                    break
+                href = await click_reason(page)
+                if DEBUG: print("   ↪ click →", href[:90])
+                if href.lower().startswith("stop"): break
+                await page.goto(href, timeout=30_000)
+
+            final_url = page.url
+
+            if not (final_url.startswith("magnet:") or re.search(r"\.(mp4|mkv|avi|torrent)$", final_url)):
+                await browser.close()
+                return {"status": "failed", "reason": "no_direct_link"}
+
+            size, path = -1, None
+            if not final_url.startswith("magnet:"):
+                resp  = await page.context.request.get(final_url, timeout=60_000)
+                if not resp.ok:
+                    await browser.close()
+                    return {"status": "failed", "reason": f"http {resp.status}"}
+
+                data  = await resp.body()
+                tmp   = pathlib.Path(tempfile.mkdtemp()) / pathlib.Path(final_url).name or "download.bin"
+                tmp.write_bytes(data)
+                size, path = tmp.stat().st_size, str(tmp)
+
+            sha = hashlib.sha256(final_url.encode()).hexdigest()
+            await browser.close()
+            return dict(status="ok",
+                        url=final_url,
+                        path=path,
+                        size=size,
+                        hash=sha,
+                        elapsed=round(time.time()-t0, 2))
+
+        except Exception as e:
+            await browser.close()
+            return {"status": "failed", "reason": repr(e)}
+
+@ray.remote
+def site_worker(url: str):
+    return asyncio.run(worker_job(url))
+
+@tool(description="DuckDuckGo search (JSON API) with exponential back-off.")
+def web_search(query: str, max_results: int = TOPK) -> list:
+    backoff, urls = 2, []
+    with DDGS() as d:
+        for attempt in range(6):
+            try:
+                urls = [r["href"] for r in d.text(query,
+                                                  max_results=max_results,
+                                                  backend="lite")]
+                if urls: break
+            except Exception:
+                if DEBUG: print(f"DDG timeout → retrying in {backoff}s")
+                time.sleep(backoff)
+                backoff *= 2
+    return urls[:max_results]
+
+@tool(description="Spawn a headless browser worker that tries to fetch direct media.")
+def fetch_media(url: str) -> dict:
+    return ray.get(site_worker.remote(url))
+
+class S(TypedDict, total=False):
+    query:        str
+    iter:         int
+    scratchpad:   List[Dict[str, str]]
+    last_obs:     str
+    search_terms: List[str]
+    candidates:   List[str]
+    results:      Dict[str, Any]
+    verified:     List[Any]
+    best:         Dict[str, Any]
+    bad_urls:     List[str]
+
+def planner(s: S):
+    if not s.get("scratchpad"):
+        s["scratchpad"], s["search_terms"], s["last_obs"] = [], [s["query"]], "Bootstrapping."
+
+    history = "\n".join(
+        f"Thought: {t['thought']}\nAction: {t['action']}\nObservation: {t['observation']}"
+        for t in s["scratchpad"]
+    ) or "None yet."
+
+    prompt = textwrap.dedent(f"""
+        You are a research agent tasked with finding publicly available
+        sources for the media below.
+
+        Title / query:  {s['query']}
+
+        Scratchpad so far:
+        {history}
+
+        Latest observation:
+        {s['last_obs']}
+
+        Respond with EITHER
+
+        1.  Thought: <why next search should help>
+            Action: Search["<query 1>", "<query 2>", ...]
+
+        OR
+
+        2.  Thought: <why a given URL is a valid answer>
+            Action: Finish["<url>"]
+    """).strip()
+
+    resp = PLAN_LLM.invoke(prompt).content.strip()
+
+    if DEBUG:
+        print("\n-----------PLANNER PROMPT ----------")
+        print(prompt)
+        print("-------- PLANNER RESPONSE ------")
+        print(resp, "\n")
+
+    thought = re.search(r"Thought:\s*(.*)", resp, re.S)
+    action  = re.search(r"Action:\s*(.*)",  resp, re.S)
+    if not (thought and action):
+        s["last_obs"] = "Planner produced malformed output – retrying."
+        return s
+
+    thought, action = thought.group(1).strip(), action.group(1).strip()
+    s["scratchpad"].append({"thought": thought, "action": action, "observation": s["last_obs"]})
+
+    if action.startswith("Search"):
+        queries = extract_json_list(action) or [s["query"]]
+        queries = [q if re.search(r"(mp4|mkv|torrent|download)", q, re.I) else q + " download"
+                   for q in queries]
+        s["search_terms"] = queries
+    elif action.startswith("Finish"):
+        url = extract_json_list(action)[0]
+        s["best"] = {"url": url}
+        s["verified"] = [("manual", s["best"])]
+
+    return s
+
+def search(s: S):
+    bad = set(s.get("bad_urls", []))
+    urls = []
+    for q in s["search_terms"]:
+        urls += web_search.run(q, max_results=TOPK)
+    urls = [u for u in urls if u not in bad]
+
+    if not urls:
+        s["last_obs"], s["iter"] = "No more candidates.", MAX_ITER
+        return s
+
+    s["candidates"] = urls[:MAX_WORKERS]
+    if DEBUG:
+        print("CANDIDATES")
+        for u in s["candidates"]: print("   •", u[:100])
+    return s
+
+def fetch(s: S):
+    s["results"] = {u: fetch_media.run(u) for u in s["candidates"]}
+    if DEBUG:
+        print("\n FETCH RESULTS")
+        for u, r in s["results"].items():
+            print(u[:80], "→", r["status"], f"({r.get('size','?')} B)")
+    return s
+
+def verify(s: S):
+    ok, lines = [], []
+    for u, r in s["results"].items():
+        if r["status"] == "ok":
+            ok.append((u, r))
+            lines.append(f"{u.split('/')[2]}")
+        else:
+            lines.append(f"{u.split('/')[2]} ({r.get('reason','?')})")
+
+    s["verified"], s["last_obs"] = ok, "; ".join(lines)
+    return s
+
+def rank(s: S):
+    if s["verified"]:
+        url, r = max(s["verified"], key=lambda x: (x[1].get("size", 0), x[0]))
+        s["best"] = {"url": url, **r}
+    return s
+
+def gate(s: S):
+    s["iter"] += 1
+    if s.get("best") or s.get("verified") or s["iter"] >= MAX_ITER:
+        return {"next": "exit"}
+    return {"next": "planner"}
+
+g = StateGraph(S)
+g.add_node("planner", planner)
+g.add_node("search",  search)
+g.add_node("fetch",   fetch)
+g.add_node("verify",  verify)
+g.add_node("rank",    rank)
+g.add_node("gate",    gate)
+g.add_node("exit",    lambda s: s)
+
+g.add_edge("planner", "search")
+g.add_edge("search",  "fetch")
+g.add_edge("fetch",   "verify")
+g.add_edge("verify",  "rank")
+g.add_edge("rank",    "gate")
+g.add_conditional_edges("gate", lambda s: s["next"], {"planner": "planner", "exit": "exit"})
+g.set_entry_point("planner")
+orch = g.compile()
+
+init = S(
+    query="Big Buck Bunny 2008 1080p mp4 download",
+    iter=0,
+    bad_urls=[]
+)
+out  = await orch.ainvoke(init, config={"recursion_limit": 40})
+
+print("\nBEST RESULT" , out.get("best", {}))
+print("TOTAL LOOPS:", out["iter"])
